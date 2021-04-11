@@ -302,6 +302,19 @@ func (b *Binance) Run() {
 		}
 	}
 
+	a := b.GetAssetTypes()
+	for x := range a {
+		if err = b.CurrencyPairs.IsAssetEnabled(a[x]); err == nil {
+			err = b.UpdateOrderExecutionLimits(a[x])
+			if err != nil {
+				log.Errorf(log.ExchangeSys,
+					"Could not set %s exchange exchange limits: %v",
+					b.Name,
+					err)
+			}
+		}
+	}
+
 	if !b.GetEnabledFeatures().AutoPairUpdates && !forceUpdate {
 		return
 	}
@@ -913,6 +926,9 @@ func (b *Binance) CancelBatchOrders(o []order.Cancel) (order.CancelBatchResponse
 
 // CancelAllOrders cancels all orders associated with a currency pair
 func (b *Binance) CancelAllOrders(req *order.Cancel) (order.CancelAllResponse, error) {
+	if err := req.Validate(); err != nil {
+		return order.CancelAllResponse{}, err
+	}
 	var cancelAllOrdersResponse order.CancelAllResponse
 	cancelAllOrdersResponse.Status = make(map[string]string)
 	switch req.AssetType {
@@ -1404,14 +1420,19 @@ func (b *Binance) ValidateCredentials(assetType asset.Item) error {
 }
 
 // FormatExchangeKlineInterval returns Interval to exchange formatted string
-func (b *Binance) FormatExchangeKlineInterval(in kline.Interval) string {
-	if in == kline.OneDay {
+func (b *Binance) FormatExchangeKlineInterval(interval kline.Interval) string {
+	switch interval {
+	case kline.OneDay:
 		return "1d"
-	}
-	if in == kline.OneMonth {
+	case kline.ThreeDay:
+		return "3d"
+	case kline.OneWeek:
+		return "1w"
+	case kline.OneMonth:
 		return "1M"
+	default:
+		return interval.Short()
 	}
-	return in.Short()
 }
 
 // GetHistoricCandles returns candles between a time period for a set time interval
@@ -1419,7 +1440,7 @@ func (b *Binance) GetHistoricCandles(pair currency.Pair, a asset.Item, start, en
 	if err := b.ValidateKline(pair, a, interval); err != nil {
 		return kline.Item{}, err
 	}
-	if kline.TotalCandlesPerInterval(start, end, interval) > b.Features.Enabled.Kline.ResultLimit {
+	if kline.TotalCandlesPerInterval(start, end, interval) > float64(b.Features.Enabled.Kline.ResultLimit) {
 		return kline.Item{}, errors.New(kline.ErrRequestExceedsExchangeLimits)
 	}
 	req := KlinesRequestParams{
@@ -1466,14 +1487,13 @@ func (b *Binance) GetHistoricCandlesExtended(pair currency.Pair, a asset.Item, s
 		Asset:    a,
 		Interval: interval,
 	}
-
-	dates := kline.CalcDateRanges(start, end, interval, b.Features.Enabled.Kline.ResultLimit)
-	for x := range dates {
+	dates := kline.CalculateCandleDateRanges(start, end, interval, b.Features.Enabled.Kline.ResultLimit)
+	for x := range dates.Ranges {
 		req := KlinesRequestParams{
 			Interval:  b.FormatExchangeKlineInterval(interval),
 			Symbol:    pair,
-			StartTime: dates[x].Start,
-			EndTime:   dates[x].End,
+			StartTime: dates.Ranges[x].Start.Time,
+			EndTime:   dates.Ranges[x].End.Time,
 			Limit:     int(b.Features.Enabled.Kline.ResultLimit),
 		}
 
@@ -1483,6 +1503,11 @@ func (b *Binance) GetHistoricCandlesExtended(pair currency.Pair, a asset.Item, s
 		}
 
 		for i := range candles {
+			for j := range ret.Candles {
+				if ret.Candles[j].Time.Equal(candles[i].OpenTime) {
+					continue
+				}
+			}
 			ret.Candles = append(ret.Candles, kline.Candle{
 				Time:   candles[i].OpenTime,
 				Open:   candles[i].Open,
@@ -1494,6 +1519,13 @@ func (b *Binance) GetHistoricCandlesExtended(pair currency.Pair, a asset.Item, s
 		}
 	}
 
+	err := dates.VerifyResultsHaveData(ret.Candles)
+	if err != nil {
+		log.Warnf(log.ExchangeSys, "%s - %s", b.Name, err)
+	}
+
+	ret.RemoveDuplicates()
+	ret.RemoveOutsideRange(start, end)
 	ret.SortCandlesByTimestamp(false)
 	return ret, nil
 }
@@ -1539,4 +1571,30 @@ func compatibleOrderVars(side, status, orderType string) OrderVars {
 		resp.OrderType = order.UnknownType
 	}
 	return resp
+}
+
+// UpdateOrderExecutionLimits sets exchange executions for a required asset type
+func (b *Binance) UpdateOrderExecutionLimits(a asset.Item) error {
+	var limits []order.MinMaxLevel
+	var err error
+	switch a {
+	case asset.Spot:
+		limits, err = b.FetchSpotExchangeLimits()
+	case asset.USDTMarginedFutures:
+		limits, err = b.FetchUSDTMarginExchangeLimits()
+	case asset.CoinMarginedFutures:
+		limits, err = b.FetchCoinMarginExchangeLimits()
+	case asset.Margin:
+		if err = b.CurrencyPairs.IsAssetEnabled(asset.Spot); err != nil {
+			limits, err = b.FetchSpotExchangeLimits()
+		} else {
+			return nil
+		}
+	default:
+		err = fmt.Errorf("unhandled asset type %s", a)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot update exchange execution limits: %v", err)
+	}
+	return b.LoadLimits(limits)
 }

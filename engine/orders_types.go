@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	errOrderCannotBeEmpty = errors.New("order cannot be empty")
+	errOrderIDCannotBeEmpty = errors.New("orderID cannot be empty")
 )
 
 type orderManagerConfig struct {
@@ -25,11 +25,11 @@ type orderManagerConfig struct {
 type orderStore struct {
 	m      sync.RWMutex
 	Orders map[string][]*order.Detail
+	bot    *Engine
 }
 
 type orderManager struct {
 	started    int32
-	stopped    int32
 	shutdown   chan struct{}
 	orderStore orderStore
 	cfg        orderManagerConfig
